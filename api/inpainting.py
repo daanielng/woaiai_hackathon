@@ -1,9 +1,9 @@
 ## This function is used as an entry point to a conversation handler in telegram bot.
-## It is called when the command /outpainting is issued by the user.
+## It is called when the command /inpainting is issued by the user.
 ## It then receives an image from the user, whilst rejecting any invalid messages (non images)
 ## It then stores that image in an s3 bucket in aws and returns a message to the user.
 ## The conversation handler then continues and prompts the user for a second image, again to be stored in s3.
-## The conversation handler then calls the outpainting function, which is left to be defined for now.
+## The conversation handler then calls the inpainting function, which is left to be defined for now.
 
 import openai
 import logging
@@ -16,17 +16,13 @@ import io
 from .utils import run_in_threadpool_decorator
 
 from telegram import __version__ as TG_VER
+from telegram import Update
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     CommandHandler,
     MessageHandler,
     filters,
-)
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 
 try:
@@ -55,48 +51,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-UPLOAD_IMAGE, PROCESS_IMAGE = range(13, 15)
+(STAGE_0, STAGE_1) = range(11, 13)
 
 
-async def outpainting_process_start(update: Update, context: ContextTypes):
-    context.user_data["editing_image_job"] = {
-        "job_type": "outpainting",
+async def inpainting_process_start(update: Update, context: ContextTypes):
+    context.user_data["inpainting_image_job"] = {
+        "job_type": "inpainting",
         "base_image_s3_key": None,
-        "outpaint_direction": None,
+        "mask_image_s3_key": None,
     }
-
-    buttons_lst = [["Left"], ["Right"], ["Top"], ["Bottom"]]
-    output_text = "Hi! You have triggered an /outpainting workflow.\n\nWhich direction would you like to outpaint / expand your image?\nSelect an option below.\n\nSend /cancel to exit the outpainting workflow."
-
-    # ask user to select one of the options
-    await update.message.reply_html(
-        f"{output_text}",
-        reply_markup=ReplyKeyboardMarkup(
-            buttons_lst, resize_keyboard=True, one_time_keyboard=True
-        ),
+    await update.message.reply_text(
+        "Hi! You have triggered an /inpainting workflow, please follow the instructions below:\n\n1. Upload a base image you would like to inpaint\n2. Once base image is received, instructions will be provided to upload a masked image of the same base image\n\nSend /cancel to exit the inpainting workflow."
     )
-    return UPLOAD_IMAGE
+    return STAGE_0
 
 
-async def outpainting_process_upload_image(update: Update, context: ContextTypes):
-    selected_direction = update.message.text
-    logger.log(logging.INFO, f"selected_direction: {selected_direction}")
-    context.user_data["editing_image_job"][
-        "outpaint_direction"
-    ] = selected_direction.lower()
+async def inpainting_process_terminate(update: Update, context: ContextTypes):
+    del context.user_data["inpainting_image_job"]
 
     await update.message.reply_text(
-        "Upload the image you would like to outpaint / expand and type out what you would like the expanded regions to contain in the caption (e.g., purple skies, blue background).\n\nSend /cancel to exit the outpainting workflow."
-    )
-
-    return PROCESS_IMAGE
-
-
-async def outpainting_process_terminate(update: Update, context: ContextTypes):
-    del context.user_data["editing_image_job"]
-
-    await update.message.reply_text(
-        "You have terminated the outpainting workflow.\n\nPlease send /outpainting to start again or send /start for a new conversation."
+        "You have terminated the inpainting workflow.\n\nPlease send /inpainting to start again or send /start for a new conversation."
     )
     return ConversationHandler.END
 
@@ -129,7 +103,60 @@ class ImageProcessor:
         logger.log(logging.INFO, f"response:{response}")
         return 0
 
-    async def outpainting_process_image(self, update: Update, context: ContextTypes):
+    async def inpainting_process_base_image(
+        self, update: Update, context: ContextTypes
+    ):
+        update_as_dict = update.to_dict()
+        update_as_json = json.dumps(update_as_dict)
+
+        logger.log(logging.INFO, f"update_as_json: {update_as_json}")
+
+        if (
+            update.message.chat.username is None
+        ):  ## User does not have username. @handle on tele.
+            username = update.message.from_user.first_name
+        else:
+            username = update.message.chat.username
+
+        # clean_username = unicodedata.name(username)
+        clean_username = username
+
+        if (
+            update.message.photo
+        ):  # User uploaded an image. Put the image into s3 bucket.Put update_as_json to SQS queue
+            # Initialize timestamp for uniqueness and file stream buffer
+            timestamp_str = datetime.now().strftime("%Y%m%d%H%M%S")
+            file_stream = io.BytesIO()
+
+            # Get file name and file id from telegram update
+            file_id = update.message.photo[-1].file_id
+            file_name = f"{file_id}{timestamp_str}.jpg"
+            file = await update.message.photo[-1].get_file()
+
+            # Download file to file stream buffer
+            await file.download_to_memory(out=file_stream)
+            file_stream.seek(0)  # Reset file stream buffer pointer to start of buffer
+
+            s3_key = f"input/base-image/{clean_username}/{file_name}"
+            await self.upload_to_s3(file_stream, self.bucket_name, s3_key)
+
+        else:
+            await update.message.reply_text(
+                "Please upload an image 🙂\n\nSend /cancel to exit the inpainting workflow."
+            )
+            return STAGE_0
+
+        # self.base_image_s3_key = s3_key
+        context.user_data["inpainting_image_job"]["base_image_s3_key"] = s3_key
+
+        await update.message.reply_text(
+            "Your base image has been received!🙂 Please use telegram's inbuilt brush feature to brush over the portion you would like to change.\n\nOptionally, type out a caption to guide the removal based on what you'd like the masked region to be replaced with (Eg. 'Blue Background', 'A tree')\n\nSend /cancel to exit the inpainting workflow."
+        )
+        return STAGE_1
+
+    async def inpainting_process_mask_image(
+        self, update: Update, context: ContextTypes
+    ):
         # self.state = ConversationHandler.END
 
         update_as_dict = update.to_dict()
@@ -163,62 +190,62 @@ class ImageProcessor:
             await file.download_to_memory(out=file_stream)
             file_stream.seek(0)  # Reset file stream buffer pointer to start of buffer
 
-            s3_key = f"input/outpaint-image/{clean_username}/{file_name}"
+            s3_key = f"input/mask-image/{clean_username}/{file_name}"
             await self.upload_to_s3(file_stream, self.bucket_name, s3_key)
             # self.mask_image_s3_key = s3_key
-            context.user_data["editing_image_job"]["base_image_s3_key"] = s3_key
+            context.user_data["inpainting_image_job"]["mask_image_s3_key"] = s3_key
 
             try:
                 MessageBody = update_as_dict
                 MessageBody["editing_image_job"] = context.user_data[
-                    "editing_image_job"
+                    "inpainting_image_job"
                 ]
 
                 await self.put_to_sqs(MessageBody)
 
                 await update.message.reply_text(
-                    "Your image has been received!🙂 Your request is currently being processed, the image will be sent to you once it is completed.\n\nThis conversation has ended. Please send /outpainting to process a new image or send /start for a new conversation."
+                    "Your masked image has been received!🙂 Your request is currently being processed, the image will be sent to you once it is completed.\n\nThis conversation has ended. Please send /inpainting to process a new image or send /start for a new conversation."
                 )
                 return ConversationHandler.END
             except Exception as e:
                 logger.log(logging.ERROR, f"Exception caught here:{e}")
                 await update.message.reply_text(
-                    "Sorry, your job has failed to submit, please try again or contact woaiai.\n\nSend /outpainting to process a new image or /start for a new conversation."
+                    "Sorry, your job has failed to submit, please try again or contact woaiai.\n\nSend /inpainting to process a new image or /start for a new conversation."
                 )
                 return ConversationHandler.END
 
         else:
             await update.message.reply_text(
-                "Please upload an image 🙂\n\nSend /cancel to stop the outpainting workflow."
+                "Please upload an image 🙂\n\nSend /cancel to stop the inpainting workflow."
             )
-            return PROCESS_IMAGE
+            return STAGE_1
 
 
 image_processor_instance = ImageProcessor()
 
-outpainting_handler = ConversationHandler(
-    entry_points=[CommandHandler("outpainting", outpainting_process_start)],
+inpainting_handler = ConversationHandler(
+    entry_points=[CommandHandler("inpainting", inpainting_process_start)],
     states={
-        UPLOAD_IMAGE: [
+        STAGE_0: [
             MessageHandler(
-                filters.Regex("(Left|Right|Top|Bottom)"),
-                outpainting_process_upload_image,
+                filters.PHOTO,
+                image_processor_instance.inpainting_process_base_image,
                 block=False,
             )
         ],
-        PROCESS_IMAGE: [
+        STAGE_1: [
             MessageHandler(
                 filters.PHOTO,
-                image_processor_instance.outpainting_process_image,
+                image_processor_instance.inpainting_process_mask_image,
                 block=False,
             )
         ],
     },
-    name="OutpaintingBot",
+    name="InpaintingBot",
     persistent=True,
     block=False,
     fallbacks=[
-        CommandHandler("cancel", outpainting_process_terminate),
-        CommandHandler("outpainting", outpainting_process_start),
+        CommandHandler("cancel", inpainting_process_terminate),
+        CommandHandler("inpainting", inpainting_process_start),
     ],
 )
